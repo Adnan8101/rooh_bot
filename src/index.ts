@@ -1,7 +1,6 @@
 import {
-  ChatInputCommandInteraction,
   Client,
-  EmbedBuilder,
+  ContainerBuilder,
   Events,
   GatewayIntentBits as I,
   Message,
@@ -9,6 +8,7 @@ import {
   Options,
   PermissionFlagsBits,
   Routes,
+  TextDisplayBuilder,
   type APIGuildMember,
   type TextBasedChannel,
 } from 'discord.js';
@@ -29,7 +29,6 @@ const bot = new Client({
 });
 
 const OWNER_ID = '929297205796417597';
-const emb = (t: string, d: string) => new EmbedBuilder().setTitle(t).setDescription(d);
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 // Guild is stored in Mongo (config.guild); it is bound by the first command run in a server.
@@ -125,38 +124,62 @@ async function roleIds(role: string) {
   }
 }
 
-async function targets(i: ChatInputCommandInteraction) {
-  const ids = new Set<string>();
-  const u = i.options.getUser('user');
-  const r = i.options.getRole('role');
-  if (u) ids.add(u.id);
-  if (r) (await roleIds(r.id)).forEach((id) => ids.add(id));
+// ---------- Command layer: one implementation, reachable via slash and prefix ----------
+
+const PREFIX = process.env.PREFIX ?? '!';
+const GREEN = 0x57f287;
+const RED = 0xed4245;
+const BLURPLE = 0x5865f2;
+
+type View = { title: string; text: string; color?: number };
+const ok = (title: string, text: string): View => ({ title, text, color: GREEN });
+const fail = (title: string, text: string): View => ({ title, text, color: RED });
+const info = (title: string, text: string): View => ({ title, text, color: BLURPLE });
+
+// Components V2 container: a clean embed-style card with a coloured accent bar.
+const card = (v: View) =>
+  new ContainerBuilder()
+    .setAccentColor(v.color ?? BLURPLE)
+    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`### ${v.title}\n${v.text}`));
+
+interface Ctx {
+  guildId: string | null;
+  userId: string;
+  canManage: boolean;
+  users: string[];
+  roles: string[];
+  channel?: string;
+}
+
+async function targets(c: Ctx) {
+  const ids = new Set(c.users);
+  for (const r of c.roles) (await roleIds(r)).forEach((id) => ids.add(id));
   return [...ids];
 }
 
-const run: Record<string, (i: ChatInputCommandInteraction) => Promise<unknown>> = {
-  async 'sync-vouches'(i) {
-    const ch = await bot.channels.fetch(i.options.getChannel('channel', true).id);
-    if (!ch?.isTextBased()) return i.editReply({ embeds: [emb('Sync vouches', 'Invalid channel.')] });
+const run: Record<string, (c: Ctx) => Promise<View>> = {
+  async syncvouches(c) {
+    const ch = c.channel ? await bot.channels.fetch(c.channel).catch(() => null) : null;
+    if (!ch?.isTextBased()) return fail('Sync vouches', 'Provide a valid text channel.');
     await config.updateOne({ _id: 'vouchChannel' }, { $set: { id: ch.id } }, { upsert: true });
     vc = ch.id;
     const n = await syncVouches(ch);
-    return i.editReply({ embeds: [emb('Sync vouches', `${n} messages synced from ${ch}.`)] });
+    return ok('Sync vouches', `${n} messages synced from ${ch}.`);
   },
 
-  async 'sync-profile'(i) {
+  async syncprofile() {
     const n = await scan();
-    return i.editReply({ embeds: [emb('Sync profile', `${tracked.size} scanned, ${n} updated.`)] });
+    return ok('Sync profile', `${tracked.size} scanned, ${n} updated.`);
   },
 
-  async 'add-user'(i) {
-    const ids = await targets(i);
-    if (!ids.length) return i.editReply({ embeds: [emb('Add user', 'Provide a user or a role.')] });
+  async addmember(c) {
+    const ids = await targets(c);
+    if (!ids.length) return fail('Add member', 'Provide a user or a role.');
     let n = 0;
     for (const id of ids) {
       const r = await users.updateOne(
         { _id: id },
-        { $setOnInsert: { addedAt: new Date(), addedBy: i.user.id } },
+        { $setOnInsert: { addedAt: new Date(), addedBy: c.userId } },
         { upsert: true },
       );
       n += r.upsertedCount;
@@ -165,38 +188,100 @@ const run: Record<string, (i: ChatInputCommandInteraction) => Promise<unknown>> 
         .then((p) => users.updateOne({ _id: id }, { $set: { ...p, syncedAt: new Date() } }))
         .catch(() => {});
     }
-    return i.editReply({ embeds: [emb('Add user', `${n} added, ${ids.length - n} already tracked.`)] });
+    return ok('Add member', `${n} added, ${ids.length - n} already tracked.`);
   },
 
-  async 'remove-user'(i) {
-    const ids = await targets(i);
-    if (!ids.length) return i.editReply({ embeds: [emb('Remove user', 'Provide a user or a role.')] });
+  async removeuser(c) {
+    const ids = await targets(c);
+    if (!ids.length) return fail('Remove user', 'Provide a user or a role.');
     const { deletedCount } = await users.deleteMany({ _id: { $in: ids } });
     ids.forEach((id) => tracked.delete(id));
-    return i.editReply({ embeds: [emb('Remove user', `${deletedCount} removed.`)] });
+    return ok('Remove user', `${deletedCount} removed.`);
+  },
+
+  async listusers() {
+    if (!tracked.size) return info('Tracked users', 'No users are being tracked.');
+    let text = '';
+    let shown = 0;
+    for (const id of tracked) {
+      const line = `<@${id}>\n`;
+      if (text.length + line.length > 3500) break;
+      text += line;
+      shown++;
+    }
+    const more = tracked.size - shown;
+    return info(`Tracked users (${tracked.size})`, text + (more ? `…and ${more} more` : ''));
+  },
+
+  async resetusers() {
+    const { deletedCount } = await users.deleteMany({});
+    tracked.clear();
+    return ok('Reset users', `${deletedCount} tracked users cleared.`);
   },
 };
 
-bot.on(Events.InteractionCreate, async (i) => {
-  if (!i.isChatInputCommand() || !run[i.commandName]) return;
-  await i.deferReply({ flags: MessageFlags.Ephemeral });
-  if (i.user.id !== OWNER_ID && !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-    return void (await i.editReply({ embeds: [emb('No permission', 'You need Manage Server or higher to use this bot.')] }));
-  }
+// Shared gatekeeping + execution. Returns the view to send back.
+async function dispatch(name: string, c: Ctx): Promise<View> {
+  if (!c.canManage) return fail('No permission', 'You need Manage Server or higher to use this bot.');
+  if (!c.guildId) return fail('Error', 'Use this in a server.');
   try {
-    if (!i.guildId) return void (await i.editReply({ embeds: [emb('Error', 'Use this in a server.')] }));
     if (!gid) {
-      gid = i.guildId;
+      gid = c.guildId;
       await config.updateOne({ _id: 'guild' }, { $set: { id: gid } }, { upsert: true });
-    } else if (gid !== i.guildId) {
-      return void (await i.editReply({ embeds: [emb('Error', 'This bot is bound to a different server.')] }));
+    } else if (gid !== c.guildId) {
+      return fail('Error', 'This bot is bound to a different server.');
     }
-    await run[i.commandName](i);
+    return await run[name](c);
   } catch (e) {
     console.error(e);
-    await i.editReply({ embeds: [emb('Error', (e as Error).message)] });
+    return fail('Error', (e as Error).message);
   }
+}
+
+const allowed = (id: string, perms?: { has(p: bigint): boolean } | null) =>
+  id === OWNER_ID || !!perms?.has(PermissionFlagsBits.ManageGuild);
+
+// Slash
+bot.on(Events.InteractionCreate, async (i) => {
+  if (!i.isChatInputCommand() || !run[i.commandName]) return;
+  const flags = MessageFlags.Ephemeral | MessageFlags.IsComponentsV2;
+  await i.deferReply({ flags });
+  const v = await dispatch(i.commandName, {
+    guildId: i.guildId,
+    userId: i.user.id,
+    canManage: allowed(i.user.id, i.memberPermissions),
+    users: [i.options.getUser('user')?.id].filter((x): x is string => !!x),
+    roles: [i.options.getRole('role')?.id].filter((x): x is string => !!x),
+    channel: i.options.getChannel('channel')?.id,
+  });
+  await i.editReply({ components: [card(v)], flags: MessageFlags.IsComponentsV2 });
 });
+
+// Prefix
+bot.on(Events.MessageCreate, async (m) => {
+  if (m.author.bot) return;
+  // Triggered by "<prefix>cmd" or "@bot cmd"
+  const mention = new RegExp(`^<@!?${bot.user?.id}>\\s*`).exec(m.content);
+  const body = mention ? m.content.slice(mention[0].length) : m.content.startsWith(PREFIX) ? m.content.slice(PREFIX.length) : null;
+  if (body === null) return;
+  const [cmd, ...args] = body.trim().split(/\s+/);
+  const name = cmd?.toLowerCase();
+  if (!name || !Object.hasOwn(run, name)) return;
+
+  const ids = (re: RegExp) => args.map((a) => a.match(re)?.[1]).filter((x): x is string => !!x);
+  const v = await dispatch(name, {
+    guildId: m.guildId,
+    userId: m.author.id,
+    canManage: allowed(m.author.id, m.member?.permissions),
+    users: [...ids(/^<@!?(\d+)>$/), ...ids(/^(\d{17,20})$/)],
+    roles: ids(/^<@&(\d+)>$/),
+    channel: ids(/^<#(\d+)>$/)[0],
+  });
+  await m
+    .reply({ components: [card(v)], flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [], repliedUser: false } })
+    .catch((e) => console.error('reply:', e.message));
+});
+
 
 const timers = new Map<string, NodeJS.Timeout>();
 

@@ -1,6 +1,7 @@
 import { SlashCommandBuilder } from 'discord.js';
 
 // Commands are visible to everyone; access is enforced at runtime in index.ts.
+// Each is also available with a text prefix (default "!"), e.g. !addmember @user
 const target = (name: string, desc: string, roleDesc: string) =>
   new SlashCommandBuilder()
     .setName(name)
@@ -10,12 +11,14 @@ const target = (name: string, desc: string, roleDesc: string) =>
 
 export const commands = [
   new SlashCommandBuilder()
-    .setName('sync-vouches')
+    .setName('syncvouches')
     .setDescription('Sync all vouch messages to the database')
     .addChannelOption((o) => o.setName('channel').setDescription('Vouch channel').setRequired(true)),
   new SlashCommandBuilder()
-    .setName('sync-profile')
+    .setName('syncprofile')
     .setDescription('Sync tracked user profiles to the database'),
-  target('add-user', 'Track a user, or every member of a role', 'Track all members of this role'),
-  target('remove-user', 'Stop tracking a user, or every member of a role', 'Remove all members of this role'),
+  target('addmember', 'Track a user, or every member of a role', 'Track all members of this role'),
+  target('removeuser', 'Stop tracking a user, or every member of a role', 'Remove all members of this role'),
+  new SlashCommandBuilder().setName('listusers').setDescription('List all tracked users'),
+  new SlashCommandBuilder().setName('resetusers').setDescription('Stop tracking all users'),
 ].map((c) => c.toJSON());
