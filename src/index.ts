@@ -128,19 +128,20 @@ async function roleIds(role: string) {
 
 const PREFIX = process.env.PREFIX ?? '!';
 const GREEN = 0x57f287;
-const RED = 0xed4245;
-const BLURPLE = 0x5865f2;
 
 type View = { title: string; text: string; color?: number };
 const ok = (title: string, text: string): View => ({ title, text, color: GREEN });
-const fail = (title: string, text: string): View => ({ title, text, color: RED });
-const info = (title: string, text: string): View => ({ title, text, color: BLURPLE });
+const fail = (title: string, text: string): View => ({ title, text });
+const info = (title: string, text: string): View => ({ title, text });
 
 // Components V2 container: a clean embed-style card with a coloured accent bar.
-const card = (v: View) =>
-  new ContainerBuilder()
-    .setAccentColor(v.color ?? BLURPLE)
-    .addTextDisplayComponents(new TextDisplayBuilder().setContent(`### ${v.title}\n${v.text}`));
+// Only success gets a colour (green); everything else has no accent bar.
+const card = (v: View) => {
+  const c = new ContainerBuilder().addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(`### ${v.title}\n${v.text}`),
+  );
+  return v.color === undefined ? c : c.setAccentColor(v.color);
+};
 
 interface Ctx {
   guildId: string | null;
@@ -257,9 +258,15 @@ async function dispatch(name: string, c: Ctx): Promise<View | null> {
   }
 }
 
-// Bot owner, server owner, or anyone with Administrator.
-const allowed = (id: string, guildOwnerId?: string, perms?: { has(p: bigint): boolean } | null) =>
-  id === OWNER_ID || id === guildOwnerId || !!perms?.has(PermissionFlagsBits.Administrator);
+// Bot owner, server owner, or anyone with Manage Server / Administrator.
+async function allowed(id: string, guildId: string | null, perms?: { has(p: bigint): boolean } | null) {
+  if (id === OWNER_ID) return true;
+  if (perms?.has(PermissionFlagsBits.ManageGuild) || perms?.has(PermissionFlagsBits.Administrator)) return true;
+  if (!guildId) return false;
+  // Owner check goes to the API so it doesn't depend on cache or a partial member payload.
+  const g = await bot.guilds.fetch(guildId).catch(() => null);
+  return g?.ownerId === id;
+}
 
 // Slash
 bot.on(Events.InteractionCreate, async (i) => {
@@ -269,7 +276,7 @@ bot.on(Events.InteractionCreate, async (i) => {
   const v = await dispatch(i.commandName, {
     guildId: i.guildId,
     userId: i.user.id,
-    canManage: allowed(i.user.id, i.guild?.ownerId, i.memberPermissions),
+    canManage: await allowed(i.user.id, i.guildId, i.memberPermissions),
     users: [i.options.getUser('user')?.id].filter((x): x is string => !!x),
     roles: [i.options.getRole('role')?.id].filter((x): x is string => !!x),
     channel: i.options.getChannel('channel')?.id,
@@ -293,7 +300,7 @@ bot.on(Events.MessageCreate, async (m) => {
   const v = await dispatch(name, {
     guildId: m.guildId,
     userId: m.author.id,
-    canManage: allowed(m.author.id, m.guild?.ownerId, m.member?.permissions),
+    canManage: await allowed(m.author.id, m.guildId, m.member?.permissions),
     users: [...ids(/^<@!?(\d+)>$/), ...ids(/^(\d{17,20})$/)],
     roles: ids(/^<@&(\d+)>$/),
     channel: ids(/^<#(\d+)>$/)[0],

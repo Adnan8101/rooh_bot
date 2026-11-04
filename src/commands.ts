@@ -23,4 +23,4 @@ export const commands = [
   new SlashCommandBuilder().setName('help').setDescription('Show all commands'),
 ]
   // Hidden from non-admins in Discord's UI; runtime checks in index.ts are the real gate.
-  .map((c) => c.setDefaultMemberPermissions(PermissionFlagsBits.Administrator).toJSON());
+  .map((c) => c.setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild).toJSON());
