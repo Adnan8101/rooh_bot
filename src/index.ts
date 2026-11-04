@@ -29,28 +29,13 @@ const bot = new Client({
 });
 
 const OWNER_ID = '929297205796417597';
-const DEBUG = process.env.DEBUG === '1';
-
-const log = (scope: string, msg: string, extra?: unknown) =>
-  console.log(`${new Date().toISOString()} [${scope}] ${msg}${extra === undefined ? '' : ' ' + JSON.stringify(extra)}`);
-const logErr = (scope: string, e: unknown) =>
-  console.error(`${new Date().toISOString()} [${scope}] ERROR`, e instanceof Error ? (e.stack ?? e.message) : e);
-
-process.on('unhandledRejection', (e) => logErr('unhandledRejection', e));
-process.on('uncaughtException', (e) => logErr('uncaughtException', e));
-bot.on(Events.Error, (e) => logErr('client', e));
-bot.on(Events.Warn, (m) => log('warn', m));
-bot.on(Events.ShardError, (e, id) => logErr(`shard ${id}`, e));
-bot.on(Events.ShardDisconnect, (ev, id) => log('shard', `disconnect ${id}`, { code: ev.code }));
-bot.on(Events.ShardReconnecting, (id) => log('shard', `reconnecting ${id}`));
-bot.on(Events.ShardResume, (id) => log('shard', `resumed ${id}`));
-if (DEBUG) bot.on(Events.Debug, (m) => log('debug', m.replace(/token[^ ]*/gi, '***')));
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+const logErr = (scope: string, e: unknown) => console.error(`[${scope}]`, e instanceof Error ? e.message : e);
 
 // Guild is stored in Mongo (config.guild); it is bound by the first command run in a server.
 let gid: string | undefined = (await config.findOne({ _id: 'guild' }))?.id;
 let vc: string | undefined = (await config.findOne({ _id: 'vouchChannel' }))?.id;
-log('boot', 'loaded config', { gid, vouchChannel: vc });
 const tracked = new Set<string>((await users.find({}, { projection: { _id: 1 } }).toArray()).map((u) => u._id));
 
 async function profile(id: string) {
@@ -311,15 +296,8 @@ async function memberPerms(m: Message) {
   }
 }
 
-async function finish(src: string, name: string, userId: string, c: Omit<Ctx, 'canManage'>, a: { ok: boolean; why: string }) {
-  log('cmd', `${src} ${name} by ${userId} in ${c.guildId ?? 'dm'} -> ${a.ok ? 'ALLOW' : 'IGNORE'} (${a.why})`, {
-    users: c.users, roles: c.roles, channel: c.channel,
-  });
-  if (!a.ok) return null;
-  const t = Date.now();
-  const v = await dispatch(name, { ...c, canManage: true });
-  log('cmd', `${name} done in ${Date.now() - t}ms`, { title: v?.title, text: v?.text.slice(0, 120) });
-  return v;
+async function finish(name: string, c: Omit<Ctx, 'canManage'>, a: { ok: boolean }) {
+  return a.ok ? dispatch(name, { ...c, canManage: true }) : null;
 }
 
 // Slash
@@ -328,9 +306,7 @@ bot.on(Events.InteractionCreate, async (i) => {
     if (!i.isChatInputCommand() || !Object.hasOwn(run, i.commandName)) return;
     await i.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2 });
     const v = await finish(
-      'slash',
       i.commandName,
-      i.user.id,
       {
         guildId: i.guildId,
         userId: i.user.id,
@@ -351,7 +327,6 @@ bot.on(Events.InteractionCreate, async (i) => {
 bot.on(Events.MessageCreate, async (m) => {
   try {
     if (m.author.bot) return;
-    if (DEBUG) log('msg', `${m.author.id} in ${m.guildId ?? 'dm'}: ${m.content.slice(0, 60)}`);
     // Triggered by "<prefix>cmd" or "@bot cmd"
     const mention = new RegExp(`^<@!?${bot.user?.id}>\\s*`).exec(m.content);
     const body = mention
@@ -362,16 +337,11 @@ bot.on(Events.MessageCreate, async (m) => {
     if (body === null) return;
     const [cmd, ...args] = body.trim().split(/\s+/);
     const name = cmd?.toLowerCase();
-    if (!name || !Object.hasOwn(run, name)) {
-      if (DEBUG) log('msg', `trigger but unknown command "${cmd}"`);
-      return;
-    }
+    if (!name || !Object.hasOwn(run, name)) return;
 
     const ids = (re: RegExp) => args.map((a) => a.match(re)?.[1]).filter((x): x is string => !!x);
     const v = await finish(
-      mention ? 'mention' : 'prefix',
       name,
-      m.author.id,
       {
         guildId: m.guildId,
         userId: m.author.id,
@@ -427,15 +397,8 @@ bot.on(Events.Raw, async ({ t, d }: { t: string; d: any }) => {
 });
 
 bot.once(Events.ClientReady, (c) => {
-  log('ready', `as ${c.user.tag} (${c.user.id})`, {
-    prefix: PREFIX,
-    guilds: c.guilds.cache.map((g) => ({ id: g.id, name: g.name, owner: g.ownerId })),
-    boundGuild: gid,
-    tracked: tracked.size,
-    intents: bot.options.intents.toArray(),
-  });
-  setInterval(() => scan().then((n) => log('scan', `${n} updated`)).catch((e) => logErr('scan', e)), 30 * 60_000);
+  console.log(`Ready as ${c.user.tag}`);
+  setInterval(() => scan().catch((e) => logErr('scan', e)), 30 * 60_000);
 });
 
-log('boot', 'logging in');
 await bot.login(process.env.DISCORD_TOKEN);
