@@ -7,6 +7,7 @@ import {
   Message,
   MessageFlags,
   Options,
+  PermissionFlagsBits,
   Routes,
   type APIGuildMember,
   type TextBasedChannel,
@@ -27,6 +28,7 @@ const bot = new Client({
   makeCache: Options.cacheWithLimits(Object.fromEntries(NO_CACHE.map((k) => [k, 0]))),
 });
 
+const OWNER_ID = '929297205796417597';
 const emb = (t: string, d: string) => new EmbedBuilder().setTitle(t).setDescription(d);
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
@@ -178,6 +180,9 @@ const run: Record<string, (i: ChatInputCommandInteraction) => Promise<unknown>> 
 bot.on(Events.InteractionCreate, async (i) => {
   if (!i.isChatInputCommand() || !run[i.commandName]) return;
   await i.deferReply({ flags: MessageFlags.Ephemeral });
+  if (i.user.id !== OWNER_ID && !i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return void (await i.editReply({ embeds: [emb('No permission', 'You need Manage Server or higher to use this bot.')] }));
+  }
   try {
     if (!i.guildId) return void (await i.editReply({ embeds: [emb('Error', 'Use this in a server.')] }));
     if (!gid) {
