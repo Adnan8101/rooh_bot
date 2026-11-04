@@ -1,6 +1,5 @@
-import { SlashCommandBuilder } from 'discord.js';
+import { PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
 
-// Commands are visible to everyone; access is enforced at runtime in index.ts.
 // Each is also available with a text prefix (default "!"), e.g. !addmember @user
 const target = (name: string, desc: string, roleDesc: string) =>
   new SlashCommandBuilder()
@@ -21,4 +20,7 @@ export const commands = [
   target('removeuser', 'Stop tracking a user, or every member of a role', 'Remove all members of this role'),
   new SlashCommandBuilder().setName('listusers').setDescription('List all tracked users'),
   new SlashCommandBuilder().setName('resetusers').setDescription('Stop tracking all users'),
-].map((c) => c.toJSON());
+  new SlashCommandBuilder().setName('help').setDescription('Show all commands'),
+]
+  // Hidden from non-admins in Discord's UI; runtime checks in index.ts are the real gate.
+  .map((c) => c.setDefaultMemberPermissions(PermissionFlagsBits.Administrator).toJSON());

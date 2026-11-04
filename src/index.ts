@@ -213,6 +213,23 @@ const run: Record<string, (c: Ctx) => Promise<View>> = {
     return info(`Tracked users (${tracked.size})`, text + (more ? `…and ${more} more` : ''));
   },
 
+  async help() {
+    const p = PREFIX;
+    return info(
+      'Help',
+      [
+        'Use `/command`, `' + p + 'command` or `@bot command`.',
+        '',
+        '`addmember <user|role>`: track a user, or every member of a role',
+        '`removeuser <user|role>`: stop tracking a user or role',
+        '`listusers`: list tracked users',
+        '`resetusers`: stop tracking everyone',
+        '`syncvouches <#channel>`: sync vouch messages',
+        '`syncprofile`: refresh tracked profiles',
+      ].join('\n'),
+    );
+  },
+
   async resetusers() {
     const { deletedCount } = await users.deleteMany({});
     tracked.clear();
@@ -221,8 +238,10 @@ const run: Record<string, (c: Ctx) => Promise<View>> = {
 };
 
 // Shared gatekeeping + execution. Returns the view to send back.
-async function dispatch(name: string, c: Ctx): Promise<View> {
-  if (!c.canManage) return fail('No permission', 'You need Manage Server or higher to use this bot.');
+// Returns null when the caller isn't allowed: the bot stays silent.
+async function dispatch(name: string, c: Ctx): Promise<View | null> {
+  if (!c.canManage) return null;
+  if (name === 'help') return run.help(c);
   if (!c.guildId) return fail('Error', 'Use this in a server.');
   try {
     if (!gid) {
@@ -238,8 +257,9 @@ async function dispatch(name: string, c: Ctx): Promise<View> {
   }
 }
 
-const allowed = (id: string, perms?: { has(p: bigint): boolean } | null) =>
-  id === OWNER_ID || !!perms?.has(PermissionFlagsBits.ManageGuild);
+// Bot owner, server owner, or anyone with Administrator.
+const allowed = (id: string, guildOwnerId?: string, perms?: { has(p: bigint): boolean } | null) =>
+  id === OWNER_ID || id === guildOwnerId || !!perms?.has(PermissionFlagsBits.Administrator);
 
 // Slash
 bot.on(Events.InteractionCreate, async (i) => {
@@ -249,11 +269,12 @@ bot.on(Events.InteractionCreate, async (i) => {
   const v = await dispatch(i.commandName, {
     guildId: i.guildId,
     userId: i.user.id,
-    canManage: allowed(i.user.id, i.memberPermissions),
+    canManage: allowed(i.user.id, i.guild?.ownerId, i.memberPermissions),
     users: [i.options.getUser('user')?.id].filter((x): x is string => !!x),
     roles: [i.options.getRole('role')?.id].filter((x): x is string => !!x),
     channel: i.options.getChannel('channel')?.id,
   });
+  if (!v) return void (await i.deleteReply().catch(() => {}));
   await i.editReply({ components: [card(v)], flags: MessageFlags.IsComponentsV2 });
 });
 
@@ -272,11 +293,12 @@ bot.on(Events.MessageCreate, async (m) => {
   const v = await dispatch(name, {
     guildId: m.guildId,
     userId: m.author.id,
-    canManage: allowed(m.author.id, m.member?.permissions),
+    canManage: allowed(m.author.id, m.guild?.ownerId, m.member?.permissions),
     users: [...ids(/^<@!?(\d+)>$/), ...ids(/^(\d{17,20})$/)],
     roles: ids(/^<@&(\d+)>$/),
     channel: ids(/^<#(\d+)>$/)[0],
   });
+  if (!v) return;
   await m
     .reply({ components: [card(v)], flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [], repliedUser: false } })
     .catch((e) => console.error('reply:', e.message));
