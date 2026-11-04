@@ -29,11 +29,28 @@ const bot = new Client({
 });
 
 const OWNER_ID = '929297205796417597';
+const DEBUG = process.env.DEBUG === '1';
+
+const log = (scope: string, msg: string, extra?: unknown) =>
+  console.log(`${new Date().toISOString()} [${scope}] ${msg}${extra === undefined ? '' : ' ' + JSON.stringify(extra)}`);
+const logErr = (scope: string, e: unknown) =>
+  console.error(`${new Date().toISOString()} [${scope}] ERROR`, e instanceof Error ? (e.stack ?? e.message) : e);
+
+process.on('unhandledRejection', (e) => logErr('unhandledRejection', e));
+process.on('uncaughtException', (e) => logErr('uncaughtException', e));
+bot.on(Events.Error, (e) => logErr('client', e));
+bot.on(Events.Warn, (m) => log('warn', m));
+bot.on(Events.ShardError, (e, id) => logErr(`shard ${id}`, e));
+bot.on(Events.ShardDisconnect, (ev, id) => log('shard', `disconnect ${id}`, { code: ev.code }));
+bot.on(Events.ShardReconnecting, (id) => log('shard', `reconnecting ${id}`));
+bot.on(Events.ShardResume, (id) => log('shard', `resumed ${id}`));
+if (DEBUG) bot.on(Events.Debug, (m) => log('debug', m.replace(/token[^ ]*/gi, '***')));
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 // Guild is stored in Mongo (config.guild); it is bound by the first command run in a server.
 let gid: string | undefined = (await config.findOne({ _id: 'guild' }))?.id;
 let vc: string | undefined = (await config.findOne({ _id: 'vouchChannel' }))?.id;
+log('boot', 'loaded config', { gid, vouchChannel: vc });
 const tracked = new Set<string>((await users.find({}, { projection: { _id: 1 } }).toArray()).map((u) => u._id));
 
 async function profile(id: string) {
@@ -70,7 +87,7 @@ async function scan() {
     try {
       if (await refresh(id)) n++;
     } catch (e) {
-      console.error(`profile ${id}:`, (e as Error).message);
+      logErr(`profile ${id}`, e);
     }
   }
   return n;
@@ -253,64 +270,127 @@ async function dispatch(name: string, c: Ctx): Promise<View | null> {
     }
     return await run[name](c);
   } catch (e) {
-    console.error(e);
+    logErr(`dispatch ${name}`, e);
     return fail('Error', (e as Error).message);
   }
 }
 
 // Bot owner, server owner, or anyone with Manage Server / Administrator.
-async function allowed(id: string, guildId: string | null, perms?: { has(p: bigint): boolean } | null) {
-  if (id === OWNER_ID) return true;
-  if (perms?.has(PermissionFlagsBits.ManageGuild) || perms?.has(PermissionFlagsBits.Administrator)) return true;
-  if (!guildId) return false;
-  // Owner check goes to the API so it doesn't depend on cache or a partial member payload.
-  const g = await bot.guilds.fetch(guildId).catch(() => null);
-  return g?.ownerId === id;
+// Returns the decision plus the reason so every outcome can be logged.
+async function allowed(
+  id: string,
+  guildId: string | null,
+  perms?: { has(p: bigint): boolean } | null,
+): Promise<{ ok: boolean; why: string }> {
+  if (id === OWNER_ID) return { ok: true, why: 'bot owner' };
+  if (!perms) return guildId ? ownerCheck(id, guildId, 'no perms resolved') : { ok: false, why: 'dm, not bot owner' };
+  if (perms.has(PermissionFlagsBits.Administrator)) return { ok: true, why: 'administrator' };
+  if (perms.has(PermissionFlagsBits.ManageGuild)) return { ok: true, why: 'manage server' };
+  return guildId ? ownerCheck(id, guildId, 'lacks manage server/admin') : { ok: false, why: 'dm, not bot owner' };
+}
+
+async function ownerCheck(id: string, guildId: string, prior: string) {
+  try {
+    const g = await bot.guilds.fetch(guildId);
+    if (g.ownerId === id) return { ok: true, why: 'server owner' };
+    return { ok: false, why: `${prior}; not server owner (owner is ${g.ownerId})` };
+  } catch (e) {
+    logErr('allowed', e);
+    return { ok: false, why: `${prior}; guild fetch failed` };
+  }
+}
+
+// message.member reads the member cache, which is disabled here, so fetch it (no caching).
+async function memberPerms(m: Message) {
+  if (!m.guild) return null;
+  try {
+    return (await m.guild.members.fetch({ user: m.author.id, cache: false })).permissions;
+  } catch (e) {
+    logErr('memberPerms', e);
+    return null;
+  }
+}
+
+async function finish(src: string, name: string, userId: string, c: Omit<Ctx, 'canManage'>, a: { ok: boolean; why: string }) {
+  log('cmd', `${src} ${name} by ${userId} in ${c.guildId ?? 'dm'} -> ${a.ok ? 'ALLOW' : 'IGNORE'} (${a.why})`, {
+    users: c.users, roles: c.roles, channel: c.channel,
+  });
+  if (!a.ok) return null;
+  const t = Date.now();
+  const v = await dispatch(name, { ...c, canManage: true });
+  log('cmd', `${name} done in ${Date.now() - t}ms`, { title: v?.title, text: v?.text.slice(0, 120) });
+  return v;
 }
 
 // Slash
 bot.on(Events.InteractionCreate, async (i) => {
-  if (!i.isChatInputCommand() || !run[i.commandName]) return;
-  const flags = MessageFlags.Ephemeral | MessageFlags.IsComponentsV2;
-  await i.deferReply({ flags });
-  const v = await dispatch(i.commandName, {
-    guildId: i.guildId,
-    userId: i.user.id,
-    canManage: await allowed(i.user.id, i.guildId, i.memberPermissions),
-    users: [i.options.getUser('user')?.id].filter((x): x is string => !!x),
-    roles: [i.options.getRole('role')?.id].filter((x): x is string => !!x),
-    channel: i.options.getChannel('channel')?.id,
-  });
-  if (!v) return void (await i.deleteReply().catch(() => {}));
-  await i.editReply({ components: [card(v)], flags: MessageFlags.IsComponentsV2 });
+  try {
+    if (!i.isChatInputCommand() || !Object.hasOwn(run, i.commandName)) return;
+    await i.deferReply({ flags: MessageFlags.Ephemeral | MessageFlags.IsComponentsV2 });
+    const v = await finish(
+      'slash',
+      i.commandName,
+      i.user.id,
+      {
+        guildId: i.guildId,
+        userId: i.user.id,
+        users: [i.options.getUser('user')?.id].filter((x): x is string => !!x),
+        roles: [i.options.getRole('role')?.id].filter((x): x is string => !!x),
+        channel: i.options.getChannel('channel')?.id,
+      },
+      await allowed(i.user.id, i.guildId, i.memberPermissions),
+    );
+    if (!v) return void (await i.deleteReply().catch((e) => logErr('deleteReply', e)));
+    await i.editReply({ components: [card(v)], flags: MessageFlags.IsComponentsV2 });
+  } catch (e) {
+    logErr(`slash ${i.isChatInputCommand() ? i.commandName : ''}`, e);
+  }
 });
 
-// Prefix
+// Prefix and @mention
 bot.on(Events.MessageCreate, async (m) => {
-  if (m.author.bot) return;
-  // Triggered by "<prefix>cmd" or "@bot cmd"
-  const mention = new RegExp(`^<@!?${bot.user?.id}>\\s*`).exec(m.content);
-  const body = mention ? m.content.slice(mention[0].length) : m.content.startsWith(PREFIX) ? m.content.slice(PREFIX.length) : null;
-  if (body === null) return;
-  const [cmd, ...args] = body.trim().split(/\s+/);
-  const name = cmd?.toLowerCase();
-  if (!name || !Object.hasOwn(run, name)) return;
+  try {
+    if (m.author.bot) return;
+    if (DEBUG) log('msg', `${m.author.id} in ${m.guildId ?? 'dm'}: ${m.content.slice(0, 60)}`);
+    // Triggered by "<prefix>cmd" or "@bot cmd"
+    const mention = new RegExp(`^<@!?${bot.user?.id}>\\s*`).exec(m.content);
+    const body = mention
+      ? m.content.slice(mention[0].length)
+      : m.content.startsWith(PREFIX)
+        ? m.content.slice(PREFIX.length)
+        : null;
+    if (body === null) return;
+    const [cmd, ...args] = body.trim().split(/\s+/);
+    const name = cmd?.toLowerCase();
+    if (!name || !Object.hasOwn(run, name)) {
+      if (DEBUG) log('msg', `trigger but unknown command "${cmd}"`);
+      return;
+    }
 
-  const ids = (re: RegExp) => args.map((a) => a.match(re)?.[1]).filter((x): x is string => !!x);
-  const v = await dispatch(name, {
-    guildId: m.guildId,
-    userId: m.author.id,
-    canManage: await allowed(m.author.id, m.guildId, m.member?.permissions),
-    users: [...ids(/^<@!?(\d+)>$/), ...ids(/^(\d{17,20})$/)],
-    roles: ids(/^<@&(\d+)>$/),
-    channel: ids(/^<#(\d+)>$/)[0],
-  });
-  if (!v) return;
-  await m
-    .reply({ components: [card(v)], flags: MessageFlags.IsComponentsV2, allowedMentions: { parse: [], repliedUser: false } })
-    .catch((e) => console.error('reply:', e.message));
+    const ids = (re: RegExp) => args.map((a) => a.match(re)?.[1]).filter((x): x is string => !!x);
+    const v = await finish(
+      mention ? 'mention' : 'prefix',
+      name,
+      m.author.id,
+      {
+        guildId: m.guildId,
+        userId: m.author.id,
+        users: [...ids(/^<@!?(\d+)>$/), ...ids(/^(\d{17,20})$/)],
+        roles: ids(/^<@&(\d+)>$/),
+        channel: ids(/^<#(\d+)>$/)[0],
+      },
+      await allowed(m.author.id, m.guildId, await memberPerms(m)),
+    );
+    if (!v) return;
+    await m.reply({
+      components: [card(v)],
+      flags: MessageFlags.IsComponentsV2,
+      allowedMentions: { parse: [], repliedUser: false },
+    });
+  } catch (e) {
+    logErr('message', e);
+  }
 });
-
 
 const timers = new Map<string, NodeJS.Timeout>();
 
@@ -320,7 +400,7 @@ const debounce = (id: string) => {
     id,
     setTimeout(() => {
       timers.delete(id);
-      refresh(id).catch((e) => console.error(`live profile ${id}:`, e.message));
+      refresh(id).catch((e) => logErr(`live profile ${id}`, e));
     }, 2000),
   );
 };
@@ -342,13 +422,20 @@ bot.on(Events.Raw, async ({ t, d }: { t: string; d: any }) => {
       await vouches.deleteMany({ _id: { $in: d.ids } });
     }
   } catch (e) {
-    console.error(`live ${t}:`, (e as Error).message);
+    logErr(`live ${t}`, e);
   }
 });
 
 bot.once(Events.ClientReady, (c) => {
-  console.log(`Ready as ${c.user.tag}`);
-  setInterval(() => scan().catch(console.error), 30 * 60_000);
+  log('ready', `as ${c.user.tag} (${c.user.id})`, {
+    prefix: PREFIX,
+    guilds: c.guilds.cache.map((g) => ({ id: g.id, name: g.name, owner: g.ownerId })),
+    boundGuild: gid,
+    tracked: tracked.size,
+    intents: bot.options.intents.toArray(),
+  });
+  setInterval(() => scan().then((n) => log('scan', `${n} updated`)).catch((e) => logErr('scan', e)), 30 * 60_000);
 });
 
+log('boot', 'logging in');
 await bot.login(process.env.DISCORD_TOKEN);
