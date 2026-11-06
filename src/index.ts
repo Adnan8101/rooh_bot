@@ -1,13 +1,17 @@
 import {
   Client,
-  EmbedBuilder,
+  ContainerBuilder,
   Events,
   type Guild,
   type GuildMember,
   GatewayIntentBits as I,
   Message,
+  MessageFlags,
   Options,
   PermissionFlagsBits,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  TextDisplayBuilder,
   type TextBasedChannel,
 } from 'discord.js';
 import { config, roles, users, vouches } from './db.js';
@@ -201,7 +205,8 @@ const TIER_LIST = TIERS.map((t) => `\`${t}\``).join(', ');
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
 // ---------- Reply UI ----------
-// Every reply is one embed. Plain (no colour) by default; green for success, red for errors.
+// Every reply is one Components V2 container: title, sections split by dividers, small footer.
+// No accent colour by default; a green bar for success, a red bar for errors.
 
 const GREEN = 0x57f287;
 const RED = 0xed4245;
@@ -214,7 +219,7 @@ const fail = (title: string, ...sections: string[]): View => ({ title, sections,
 const usage = (title: string, syntax: string, ...more: string[]) => fail(title, `**Usage**\n\`${PREFIX}${syntax}\``, ...more);
 const tierHelp = `**Tiers**, highest first\n${TIERS.map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
 
-// Embed descriptions hold 4096 characters.
+// A V2 message holds 4000 characters of text across all its text components.
 function fit(v: View) {
   let left = 3800 - v.title.length;
   return v.sections.flatMap((s) => {
@@ -225,13 +230,16 @@ function fit(v: View) {
   });
 }
 
+const text = (s: string) => new TextDisplayBuilder().setContent(s);
+const divider = (line = true) => new SeparatorBuilder().setDivider(line).setSpacing(SeparatorSpacingSize.Small);
+
 function render(v: View) {
-  const e = new EmbedBuilder()
-    .setTitle(v.title)
-    .setDescription(fit(v).join('\n\n'))
-    .setFooter({ text: v.footer ?? `ROOH  |  ${PREFIX}help for every command` });
-  if (v.tone) e.setColor(v.tone === 'ok' ? GREEN : RED);
-  return e;
+  const c = new ContainerBuilder();
+  if (v.tone) c.setAccentColor(v.tone === 'ok' ? GREEN : RED);
+  c.addTextDisplayComponents(text(`## ${v.title}`));
+  for (const s of fit(v)) c.addSeparatorComponents(divider()).addTextDisplayComponents(text(s));
+  c.addSeparatorComponents(divider(false)).addTextDisplayComponents(text(`-# ${v.footer ?? `ROOH  |  ${PREFIX}help for every command`}`));
+  return c;
 }
 
 const cmdLine = (syntax: string, what: string) => `\`${PREFIX}${syntax}\`\n-# ${what}`;
@@ -368,14 +376,14 @@ bot.on(Events.MessageCreate, async (m) => {
   if (!cmd) return;
   const quiet = { repliedUser: false, users: [], roles: [] };
   // Sent as a normal message, not a reply: replying needs Read Message History, which the bot may not have.
-  // If embeds are blocked too (no Embed Links), fall back to plain text so the bot never goes silent.
+  // If the V2 message is blocked, fall back to plain text so the bot never goes silent.
   const say = async (v: View) => {
     try {
-      await m.channel.send({ embeds: [render(v)], allowedMentions: quiet });
+      await m.channel.send({ components: [render(v)], flags: MessageFlags.IsComponentsV2, allowedMentions: quiet });
     } catch (e) {
       logErr(`reply ${name}`, e);
-      const text = `**${v.title}**\n${v.sections.join('\n\n')}`.slice(0, 2000);
-      await m.channel.send({ content: text, allowedMentions: quiet }).catch((e2) => logErr(`send ${name}`, e2));
+      const plain = `**${v.title}**\n${v.sections.join('\n\n')}`.slice(0, 2000);
+      await m.channel.send({ content: plain, allowedMentions: quiet }).catch((e2) => logErr(`send ${name}`, e2));
     }
   };
   console.log(`[cmd] ${m.author.tag} (${m.author.id}) ran !${name} in ${m.guild.name}`);
