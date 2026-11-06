@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc",
     "deploy": "tsc && node --env-file=.env dist/deploy.js",
-    "start": "tsc && node --max-old-space-size=96 --env-file=.env dist/index.js"
+    "start": "tsc && node --max-old-space-size=256 --env-file=.env dist/index.js"
   },
   "dependencies": {
     "discord.js": "^14.16.0",
