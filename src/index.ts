@@ -1,15 +1,13 @@
 import {
   Client,
-  ContainerBuilder,
+  EmbedBuilder,
   Events,
+  type Guild,
+  type GuildMember,
   GatewayIntentBits as I,
   Message,
-  MessageFlags,
   Options,
   PermissionFlagsBits,
-  SeparatorBuilder,
-  SeparatorSpacingSize,
-  TextDisplayBuilder,
   type TextBasedChannel,
 } from 'discord.js';
 import { config, roles, users, vouches } from './db.js';
@@ -118,11 +116,34 @@ async function checkMember(id: string, roleIds: string[] | null, isBot = false) 
 }
 
 /** Full pass over the server: make the role-based part of the team match Discord exactly. */
-async function reconcile() {
+/**
+ * Every member of the server, read over REST 1000 at a time. (Fetching through the gateway is
+ * limited to about once per 30s and was failing with "opcode 8 was rate limited".)
+ */
+async function allMembers(g: Guild) {
+  const out = new Map<string, GuildMember>();
+  let after = '0';
+  for (;;) {
+    const page = await g.members.list({ limit: 1000, after, cache: false });
+    for (const [id, m] of page) out.set(id, m);
+    if (page.size < 1000) return out;
+    after = [...page.keys()].reduce((a, b) => (BigInt(a) > BigInt(b) ? a : b));
+  }
+}
+
+// Runs one reconcile at a time; overlapping calls queue up instead of colliding.
+let queue: Promise<unknown> = Promise.resolve();
+function reconcile() {
+  const next = queue.then(reconcileNow);
+  queue = next.catch(() => {});
+  return next;
+}
+
+async function reconcileNow() {
   const g = guild();
   if (!g) return { added: 0, removed: 0 };
-  const members = await g.members.fetch();
-  const want = members.filter((m) => !m.user.bot && m.roles.cache.some((r) => roleMap.has(r.id)));
+  const all = await allMembers(g);
+  const want = new Map([...all].filter(([, m]) => !m.user.bot && m.roles.cache.some((r) => roleMap.has(r.id))));
   let added = 0;
   for (const m of want.values()) {
     if (tracked.has(m.id)) continue;
@@ -179,20 +200,21 @@ const roleId = (a = '') => a.match(/^<@&(\d+)>$|^(\d{17,20})$/)?.slice(1).find(B
 const TIER_LIST = TIERS.map((t) => `\`${t}\``).join(', ');
 const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
-// ---------- Reply UI (Discord Components V2) ----------
-// Every reply is one container: accent bar, title, sections split by dividers, small footer.
+// ---------- Reply UI ----------
+// Every reply is one embed. Plain (no colour) by default; green for success, red for errors.
 
-const VIOLET = 0x8b3dff;
-const RED = 0xff2e51;
+const GREEN = 0x57f287;
+const RED = 0xed4245;
 
 type View = { title: string; sections: string[]; tone?: 'ok' | 'error'; footer?: string };
 
-const ok = (title: string, ...sections: string[]): View => ({ title, sections });
+const info = (title: string, ...sections: string[]): View => ({ title, sections });
+const ok = (title: string, ...sections: string[]): View => ({ title, sections, tone: 'ok' });
 const fail = (title: string, ...sections: string[]): View => ({ title, sections, tone: 'error' });
 const usage = (title: string, syntax: string, ...more: string[]) => fail(title, `**Usage**\n\`${PREFIX}${syntax}\``, ...more);
 const tierHelp = `**Tiers**, highest first\n${TIERS.map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
 
-// Discord allows 4000 characters of text per message across all text components.
+// Embed descriptions hold 4096 characters.
 function fit(v: View) {
   let left = 3800 - v.title.length;
   return v.sections.flatMap((s) => {
@@ -204,15 +226,12 @@ function fit(v: View) {
 }
 
 function render(v: View) {
-  const c = new ContainerBuilder().setAccentColor(v.tone === 'error' ? RED : VIOLET);
-  c.addTextDisplayComponents(new TextDisplayBuilder().setContent(`## ${v.title}`));
-  for (const s of fit(v)) {
-    c.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
-    c.addTextDisplayComponents(new TextDisplayBuilder().setContent(s));
-  }
-  c.addSeparatorComponents(new SeparatorBuilder().setDivider(false).setSpacing(SeparatorSpacingSize.Small));
-  c.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${v.footer ?? `ROOH  |  ${PREFIX}help for every command`}`));
-  return c;
+  const e = new EmbedBuilder()
+    .setTitle(v.title)
+    .setDescription(fit(v).join('\n\n'))
+    .setFooter({ text: v.footer ?? `ROOH  |  ${PREFIX}help for every command` });
+  if (v.tone) e.setColor(v.tone === 'ok' ? GREEN : RED);
+  return e;
 }
 
 const cmdLine = (syntax: string, what: string) => `\`${PREFIX}${syntax}\`\n-# ${what}`;
@@ -300,17 +319,17 @@ const run: Record<string, (m: Message, args: string[]) => Promise<View>> = {
       return [`**${t ?? 'No tier - hidden'}**  -  ${who.length}\n${names}`];
     });
     const shown = list.filter((u) => tierOf(u)).length;
-    return { ...ok('Website users', ...(sections.length ? sections : ['Nobody yet. Add someone with `!adduser` or link a role with `!addrole`.'])), footer: `${plural(shown, 'person')} on the website  |  (role) = listed through a linked role` };
+    return { ...info('Website users', ...(sections.length ? sections : ['Nobody yet. Add someone with `!adduser` or link a role with `!addrole`.'])), footer: `${plural(shown, 'person')} on the website  |  (role) = listed through a linked role` };
   },
 
   async listroles() {
     const list = [...roleMap].sort((a, b) => TIERS.indexOf(a[1]) - TIERS.indexOf(b[1]));
-    if (!list.length) return ok('Linked roles', `No roles linked yet.\n-# Use \`${PREFIX}addrole @role <tier>\`.`);
+    if (!list.length) return info('Linked roles', `No roles linked yet.\n-# Use \`${PREFIX}addrole @role <tier>\`.`);
     const byTier = TIERS.flatMap((t) => {
       const rs = list.filter(([, x]) => x === t);
       return rs.length ? [`**${t}**\n${rs.map(([id]) => `<@&${id}>`).join('  ')}`] : [];
     });
-    return { ...ok('Linked roles', ...byTier), footer: `${plural(list.length, 'role')} linked` };
+    return { ...info('Linked roles', ...byTier), footer: `${plural(list.length, 'role')} linked` };
   },
 
   async resetdata(m, [confirm]) {
@@ -348,10 +367,11 @@ bot.on(Events.MessageCreate, async (m) => {
   const cmd = run[name?.toLowerCase()];
   if (!cmd) return;
   const quiet = { repliedUser: false, users: [], roles: [] };
-  // V2 reply first; if the channel blocks it, fall back to plain text so the bot never goes silent.
+  // Sent as a normal message, not a reply: replying needs Read Message History, which the bot may not have.
+  // If embeds are blocked too (no Embed Links), fall back to plain text so the bot never goes silent.
   const say = async (v: View) => {
     try {
-      await m.reply({ components: [render(v)], flags: MessageFlags.IsComponentsV2, allowedMentions: quiet });
+      await m.channel.send({ embeds: [render(v)], allowedMentions: quiet });
     } catch (e) {
       logErr(`reply ${name}`, e);
       const text = `**${v.title}**\n${v.sections.join('\n\n')}`.slice(0, 2000);
