@@ -1,6 +1,6 @@
 import { MongoClient } from 'mongodb';
 
-const m = new MongoClient(process.env.MONGODB_URI!, { maxPoolSize: 2 });
+const m = new MongoClient(process.env.MONGODB_URI!, { maxPoolSize: 2, serverSelectionTimeoutMS: 15000 });
 await m.connect();
 
 const db = m.db('rooh');
