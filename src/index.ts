@@ -1,11 +1,15 @@
 import {
   Client,
-  EmbedBuilder,
+  ContainerBuilder,
   Events,
   GatewayIntentBits as I,
   Message,
+  MessageFlags,
   Options,
   PermissionFlagsBits,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  TextDisplayBuilder,
   type TextBasedChannel,
 } from 'discord.js';
 import { config, roles, users, vouches } from './db.js';
@@ -29,7 +33,6 @@ const bot = new Client({
 });
 
 const OWNER_ID = '929297205796417597';
-const emb = (t: string, d: string) => new EmbedBuilder().setTitle(t).setDescription(d.slice(0, 4000));
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 
 const logErr = (scope: string, e: unknown) => console.error(`[${scope}]`, e instanceof Error ? e.message : e);
@@ -174,28 +177,65 @@ const tier = (s: string) => TIERS.find((t) => key(t) === key(s));
 const userId = (a = '') => a.match(/^<@!?(\d+)>$|^(\d{17,20})$/)?.slice(1).find(Boolean);
 const roleId = (a = '') => a.match(/^<@&(\d+)>$|^(\d{17,20})$/)?.slice(1).find(Boolean);
 const TIER_LIST = TIERS.map((t) => `\`${t}\``).join(', ');
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
-const HELP = [
-  `\`${PREFIX}adduser @user <tier>\` - put a member on the website in a tier`,
-  `\`${PREFIX}removeuser @user\` - take a member off the website`,
-  `\`${PREFIX}addrole @role <tier>\` - everyone with this role goes in that tier`,
-  `\`${PREFIX}removerole @role\` - unlink a role`,
-  `\`${PREFIX}listusers\` - everyone on the website, by tier`,
-  `\`${PREFIX}listroles\` - linked roles and their tiers`,
-  `\`${PREFIX}resetdata confirm\` - wipe all users and role links`,
-  `\`${PREFIX}syncvouches #channel\` - sync all vouch messages`,
-  `\`${PREFIX}syncprofile\` - refresh profiles and role members`,
-  '',
-  `Tiers, highest first: ${TIER_LIST}`,
-  'Someone who qualifies for several tiers is shown once, in the highest.',
-].join('\n');
+// ---------- Reply UI (Discord Components V2) ----------
+// Every reply is one container: accent bar, title, sections split by dividers, small footer.
 
-// Each command returns [title, description] for the reply embed.
-const run: Record<string, (m: Message, args: string[]) => Promise<[string, string]>> = {
+const VIOLET = 0x8b3dff;
+const RED = 0xff2e51;
+
+type View = { title: string; sections: string[]; tone?: 'ok' | 'error'; footer?: string };
+
+const ok = (title: string, ...sections: string[]): View => ({ title, sections });
+const fail = (title: string, ...sections: string[]): View => ({ title, sections, tone: 'error' });
+const usage = (title: string, syntax: string, ...more: string[]) => fail(title, `**Usage**\n\`${PREFIX}${syntax}\``, ...more);
+const tierHelp = `**Tiers**, highest first\n${TIERS.map((t, i) => `${i + 1}. ${t}`).join('\n')}`;
+
+// Discord allows 4000 characters of text per message across all text components.
+function fit(v: View) {
+  let left = 3800 - v.title.length;
+  return v.sections.flatMap((s) => {
+    if (left <= 0) return [];
+    const cut = s.length > left ? `${s.slice(0, left - 20)}\n-# ...and more` : s;
+    left -= cut.length;
+    return [cut];
+  });
+}
+
+function render(v: View) {
+  const c = new ContainerBuilder().setAccentColor(v.tone === 'error' ? RED : VIOLET);
+  c.addTextDisplayComponents(new TextDisplayBuilder().setContent(`## ${v.title}`));
+  for (const s of fit(v)) {
+    c.addSeparatorComponents(new SeparatorBuilder().setDivider(true).setSpacing(SeparatorSpacingSize.Small));
+    c.addTextDisplayComponents(new TextDisplayBuilder().setContent(s));
+  }
+  c.addSeparatorComponents(new SeparatorBuilder().setDivider(false).setSpacing(SeparatorSpacingSize.Small));
+  c.addTextDisplayComponents(new TextDisplayBuilder().setContent(`-# ${v.footer ?? `ROOH  |  ${PREFIX}help for every command`}`));
+  return c;
+}
+
+const cmdLine = (syntax: string, what: string) => `\`${PREFIX}${syntax}\`\n-# ${what}`;
+
+const HELP: View = {
+  title: 'ROOH bot',
+  sections: [
+    'Controls who appears on the ROOH website and keeps vouches in sync with Discord.',
+    ['**Website users**', cmdLine('adduser @user <tier>', 'Put a member on the website in a tier'), cmdLine('removeuser @user', 'Take a member off the website'), cmdLine('listusers', 'Everyone on the website, by tier')].join('\n'),
+    ['**Roles**', cmdLine('addrole @role <tier>', 'Everyone with this role goes in that tier'), cmdLine('removerole @role', 'Unlink a role'), cmdLine('listroles', 'Linked roles and their tiers')].join('\n'),
+    ['**Sync**', cmdLine('syncvouches #channel', 'Sync every message in the vouch channel'), cmdLine('syncprofile', 'Refresh profiles and role members')].join('\n'),
+    ['**Data**', cmdLine('resetdata confirm', 'Delete all website users and role links. Vouches are kept')].join('\n'),
+    `${tierHelp}\n-# Someone who qualifies for several tiers is shown once, in the highest.`,
+  ],
+};
+
+// ---------- Commands ----------
+
+const run: Record<string, (m: Message, args: string[]) => Promise<View>> = {
   async adduser(m, [who, ...rest]) {
     const id = userId(who);
     const t = tier(rest.join(' '));
-    if (!id || !t) return ['Add user', `Usage: \`${PREFIX}adduser @user <tier>\`\nTiers: ${TIER_LIST}`];
+    if (!id || !t) return usage('Add user', 'adduser @user <tier>', tierHelp);
     const r = await users.updateOne(
       { _id: id },
       { $set: { manualTier: t, addedBy: m.author.id }, $setOnInsert: { addedAt: new Date() } },
@@ -204,84 +244,101 @@ const run: Record<string, (m: Message, args: string[]) => Promise<[string, strin
     tracked.add(id);
     await save(id);
     const shown = tierOf((await users.findOne({ _id: id })) ?? {});
-    const note = shown && shown !== t ? `\nShown as **${shown}** on the website - a role of theirs ranks higher.` : '';
-    return ['Add user', `<@${id}> ${r.upsertedCount ? 'added as' : 'is now'} **${t}**.${note}`];
+    return ok(
+      r.upsertedCount ? 'User added' : 'Tier updated',
+      `<@${id}> ${r.upsertedCount ? 'is now on the website as' : 'is now'} **${t}**.`,
+      ...(shown && shown !== t ? [`**Shown as ${shown}**\n-# One of their linked roles ranks higher, so the website places them there.`] : []),
+    );
   },
 
   async removeuser(m, [who]) {
     const id = userId(who);
-    if (!id) return ['Remove user', `Usage: \`${PREFIX}removeuser @user\``];
+    if (!id) return usage('Remove user', 'removeuser @user');
     const doc = await users.findOne({ _id: id });
-    if (!doc) return ['Remove user', `<@${id}> is not on the website.`];
+    if (!doc) return fail('Remove user', `<@${id}> is not on the website.`);
     const viaRole = (doc.roles ?? []).find((r: { id: string }) => roleMap.has(r.id));
     if (viaRole) {
       await users.updateOne({ _id: id }, { $unset: { manualTier: '' }, $set: { addedBy: 'role' } });
-      return ['Remove user', `Removed <@${id}>'s own tier, but they still hold <@&${viaRole.id}> (**${roleMap.get(viaRole.id)}**), so they stay listed. Use \`${PREFIX}removerole\` or take the role away.`];
+      return fail(
+        'Still listed',
+        `Removed <@${id}>'s own tier, but they hold <@&${viaRole.id}>, which is linked to **${roleMap.get(viaRole.id)}**.`,
+        `-# Unlink it with \`${PREFIX}removerole\` or take the role away to remove them completely.`,
+      );
     }
     await users.deleteOne({ _id: id });
     tracked.delete(id);
-    return ['Remove user', `<@${id}> removed from the website.`];
+    return ok('User removed', `<@${id}> is no longer on the website.`);
   },
 
   async addrole(m, [r, ...rest]) {
     const id = roleId(r);
     const t = tier(rest.join(' '));
     const role = id ? await m.guild!.roles.fetch(id).catch(() => null) : null;
-    if (!role || !t) return ['Add role', `Usage: \`${PREFIX}addrole @role <tier>\`\nTiers: ${TIER_LIST}`];
+    if (!role || !t) return usage('Add role', 'addrole @role <tier>', tierHelp);
     await roles.updateOne({ _id: role.id }, { $set: { name: role.name, tier: t, addedBy: m.author.id, addedAt: new Date() } }, { upsert: true });
     roleMap.set(role.id, t);
     const { added } = await reconcile();
-    return ['Add role', `Everyone with ${role} now shows as **${t}** on the website.\n${added} new member${added === 1 ? '' : 's'} added.`];
+    return ok('Role linked', `Everyone with ${role} now shows as **${t}** on the website.`, `**${plural(added, 'new member')}** added\n-# Members gaining or losing this role update automatically.`);
   },
 
   async removerole(m, [r]) {
     const id = roleId(r);
-    if (!id) return ['Remove role', `Usage: \`${PREFIX}removerole @role\``];
+    if (!id) return usage('Remove role', 'removerole @role');
     const { deletedCount } = await roles.deleteOne({ _id: id });
     roleMap.delete(id);
-    if (!deletedCount) return ['Remove role', `<@&${id}> is not linked.`];
+    if (!deletedCount) return fail('Remove role', `<@&${id}> is not linked to a tier.`);
     const { removed } = await reconcile();
-    return ['Remove role', `<@&${id}> unlinked. ${removed} member${removed === 1 ? '' : 's'} who were only listed through it removed.`];
+    return ok('Role unlinked', `<@&${id}> no longer places anyone on the website.`, `**${plural(removed, 'member')}** removed\n-# Only people who were listed through this role alone.`);
   },
 
   async listusers() {
     const list = await users.find({ bot: { $ne: true } }, { projection: { manualTier: 1, roles: 1 } }).toArray();
-    const groups = [...TIERS, undefined].map((t) => {
+    const sections = [...TIERS, undefined].flatMap((t) => {
       const who = list.filter((u) => tierOf(u) === t);
-      return who.length ? `**${t ?? 'No tier (hidden)'}** (${who.length})\n${who.map((u) => `<@${u._id}>${u.manualTier ? '' : ' · via role'}`).join(', ')}` : '';
+      if (!who.length) return [];
+      const names = who.map((u) => `<@${u._id}>${u.manualTier ? '' : ' (role)'}`).join('  ');
+      return [`**${t ?? 'No tier - hidden'}**  -  ${who.length}\n${names}`];
     });
-    return ['Users', groups.filter(Boolean).join('\n\n') || 'Nobody yet.'];
+    const shown = list.filter((u) => tierOf(u)).length;
+    return { ...ok('Website users', ...(sections.length ? sections : ['Nobody yet. Add someone with `!adduser` or link a role with `!addrole`.'])), footer: `${plural(shown, 'person')} on the website  |  (role) = listed through a linked role` };
   },
 
   async listroles() {
     const list = [...roleMap].sort((a, b) => TIERS.indexOf(a[1]) - TIERS.indexOf(b[1]));
-    return ['Roles', list.map(([id, t]) => `<@&${id}> → **${t}**`).join('\n') || `No roles linked. Use \`${PREFIX}addrole @role <tier>\`.`];
+    if (!list.length) return ok('Linked roles', `No roles linked yet.\n-# Use \`${PREFIX}addrole @role <tier>\`.`);
+    const byTier = TIERS.flatMap((t) => {
+      const rs = list.filter(([, x]) => x === t);
+      return rs.length ? [`**${t}**\n${rs.map(([id]) => `<@&${id}>`).join('  ')}`] : [];
+    });
+    return { ...ok('Linked roles', ...byTier), footer: `${plural(list.length, 'role')} linked` };
   },
 
   async resetdata(m, [confirm]) {
-    if (confirm !== 'confirm') return ['Reset data', `This deletes every website user and role link (vouches are kept).\nRun \`${PREFIX}resetdata confirm\` to do it.`];
+    if (confirm !== 'confirm')
+      return fail('Reset data', 'This deletes **every website user and role link**. Vouches are kept.', `Run \`${PREFIX}resetdata confirm\` to go ahead.`);
     const [u, r] = await Promise.all([users.deleteMany({}), roles.deleteMany({})]);
     tracked.clear();
     roleMap.clear();
-    return ['Reset data', `Deleted ${u.deletedCount} users and ${r.deletedCount} role links.`];
+    return ok('Data reset', `Deleted **${plural(u.deletedCount, 'user')}** and **${plural(r.deletedCount, 'role link')}**.`);
   },
 
   async syncvouches(m, [chan]) {
     const id = chan?.match(/^<#(\d+)>$/)?.[1] ?? chan;
     const ch = id ? await bot.channels.fetch(id).catch(() => null) : null;
-    if (!ch?.isTextBased()) return ['Sync vouches', `Usage: \`${PREFIX}syncvouches #channel\``];
+    if (!ch?.isTextBased()) return usage('Sync vouches', 'syncvouches #channel');
     await config.updateOne({ _id: 'vouchChannel' }, { $set: { id: ch.id } }, { upsert: true });
     vc = ch.id;
-    return ['Sync vouches', `${await syncVouches(ch)} messages synced from ${ch}.`];
+    const n = await syncVouches(ch);
+    return ok('Vouches synced', `**${plural(n, 'message')}** synced from ${ch}.`, '-# New, edited and deleted messages in this channel now update the website live.');
   },
 
   async syncprofile() {
     const { added, removed } = await reconcile();
-    return ['Sync profile', `${tracked.size} users checked. ${added} added, ${removed} removed through roles.`];
+    return ok('Profiles synced', `**${plural(tracked.size, 'user')}** checked.`, `**${added}** added  |  **${removed}** removed through roles`);
   },
 
   async help() {
-    return ['ROOH bot', HELP];
+    return HELP;
   },
 };
 
@@ -291,13 +348,14 @@ bot.on(Events.MessageCreate, async (m) => {
   const cmd = run[name?.toLowerCase()];
   if (!cmd) return;
   const quiet = { repliedUser: false, users: [], roles: [] };
-  // Embed reply first; if the channel blocks embeds or replies, fall back to plain text so the bot never goes silent.
-  const say = async (t: string, d: string) => {
+  // V2 reply first; if the channel blocks it, fall back to plain text so the bot never goes silent.
+  const say = async (v: View) => {
     try {
-      await m.reply({ embeds: [emb(t, d)], allowedMentions: quiet });
+      await m.reply({ components: [render(v)], flags: MessageFlags.IsComponentsV2, allowedMentions: quiet });
     } catch (e) {
       logErr(`reply ${name}`, e);
-      await m.channel.send({ content: `**${t}**\n${d}`.slice(0, 2000), allowedMentions: quiet }).catch((e2) => logErr(`send ${name}`, e2));
+      const text = `**${v.title}**\n${v.sections.join('\n\n')}`.slice(0, 2000);
+      await m.channel.send({ content: text, allowedMentions: quiet }).catch((e2) => logErr(`send ${name}`, e2));
     }
   };
   console.log(`[cmd] ${m.author.tag} (${m.author.id}) ran !${name} in ${m.guild.name}`);
@@ -307,19 +365,19 @@ bot.on(Events.MessageCreate, async (m) => {
     if (m.author.id !== OWNER_ID) {
       const member = await m.guild.members.fetch({ user: m.author.id, cache: false });
       if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-        return void (await say('No permission', 'You need Manage Server or higher to use this bot.'));
+        return void (await say(fail('No permission', 'You need **Manage Server** or higher to use this bot.')));
       }
     }
     if (!gid) {
       gid = m.guildId;
       await config.updateOne({ _id: 'guild' }, { $set: { id: gid } }, { upsert: true });
     } else if (gid !== m.guildId) {
-      return void (await say('Error', 'This bot is bound to a different server.'));
+      return void (await say(fail('Wrong server', 'This bot is bound to a different server.')));
     }
-    await say(...(await cmd(m, args)));
+    await say(await cmd(m, args));
   } catch (e) {
     logErr(`cmd ${name}`, e);
-    await say('Error', (e as Error).message);
+    await say(fail('Something went wrong', `\`${(e as Error).message}\``));
   }
 });
 
