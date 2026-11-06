@@ -290,11 +290,25 @@ bot.on(Events.MessageCreate, async (m) => {
   const [name, ...args] = m.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd = run[name?.toLowerCase()];
   if (!cmd) return;
-  const say = (t: string, d: string) => m.reply({ embeds: [emb(t, d)], allowedMentions: { repliedUser: false, users: [], roles: [] } });
+  const quiet = { repliedUser: false, users: [], roles: [] };
+  // Embed reply first; if the channel blocks embeds or replies, fall back to plain text so the bot never goes silent.
+  const say = async (t: string, d: string) => {
+    try {
+      await m.reply({ embeds: [emb(t, d)], allowedMentions: quiet });
+    } catch (e) {
+      logErr(`reply ${name}`, e);
+      await m.channel.send({ content: `**${t}**\n${d}`.slice(0, 2000), allowedMentions: quiet }).catch((e2) => logErr(`send ${name}`, e2));
+    }
+  };
+  console.log(`[cmd] ${m.author.tag} (${m.author.id}) ran !${name} in ${m.guild.name}`);
   try {
-    const member = await m.guild.members.fetch({ user: m.author.id, cache: false });
-    if (m.author.id !== OWNER_ID && !member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      return void (await say('No permission', 'You need Manage Server or higher to use this bot.'));
+    await m.channel.sendTyping().catch(() => {});
+    // The bot owner is always allowed; everyone else needs Manage Server.
+    if (m.author.id !== OWNER_ID) {
+      const member = await m.guild.members.fetch({ user: m.author.id, cache: false });
+      if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+        return void (await say('No permission', 'You need Manage Server or higher to use this bot.'));
+      }
     }
     if (!gid) {
       gid = m.guildId;
@@ -304,8 +318,8 @@ bot.on(Events.MessageCreate, async (m) => {
     }
     await say(...(await cmd(m, args)));
   } catch (e) {
-    console.error(e);
-    await say('Error', (e as Error).message).catch(() => {});
+    logErr(`cmd ${name}`, e);
+    await say('Error', (e as Error).message);
   }
 });
 
