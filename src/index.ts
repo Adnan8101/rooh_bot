@@ -21,7 +21,7 @@ import { config, roles, users, vouches } from './db.js';
 
 const PREFIX = '!';
 // Website tiers, highest first. Must match TIERS in website/app/team/data.ts.
-const TIERS = ['Owner', 'Imposter', 'Malkin', 'Developer', 'Co Owner', 'Manager', 'Head Mod', 'Staff Team'];
+const TIERS = ['Owner', 'Imposter', 'Developer', 'Malkin', 'Co Owner', 'Manager', 'Head Mod', 'Staff Team'];
 
 const NO_CACHE = [
   'MessageManager', 'PresenceManager', 'ReactionManager',
