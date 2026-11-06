@@ -48,9 +48,34 @@ const roleMap = new Map<string, string>((await roles.find().toArray()).map((r) =
 
 const guild = () => (gid ? bot.guilds.cache.get(gid) : undefined);
 
+/** Runs fn over items with at most n requests in flight. */
+async function pool<T>(items: T[], n: number, fn: (t: T) => Promise<unknown>) {
+  const it = items[Symbol.iterator]();
+  await Promise.all(
+    Array.from({ length: Math.min(n, items.length) }, async () => {
+      for (const x of it) await fn(x).catch((e) => logErr('pool', e));
+    }),
+  );
+}
+
+/** Everything the website needs that comes with a guild member, with no extra request. */
+const fromMember = (m: GuildMember) => ({
+  username: m.user.username,
+  globalName: m.user.globalName,
+  displayName: m.displayName,
+  bot: m.user.bot,
+  avatar: m.displayAvatarURL({ size: 512 }),
+  createdAt: m.user.createdAt,
+  joinedAt: m.joinedAt ?? null,
+  roles: m.roles.cache.filter((r) => r.id !== gid).map((r) => ({ id: r.id, name: r.name })),
+});
+
+/** Full profile: user (for banner/accent) and member fetched in parallel. */
 async function profile(id: string) {
-  const u = await bot.users.fetch(id, { force: true });
-  const m = await guild()?.members.fetch({ user: id, cache: false }).catch(() => null);
+  const [u, m] = await Promise.all([
+    bot.users.fetch(id, { force: true }),
+    guild()?.members.fetch({ user: id, cache: false }).catch(() => null) ?? null,
+  ]);
   return {
     username: u.username,
     globalName: u.globalName,
@@ -68,7 +93,13 @@ async function profile(id: string) {
 const save = (id: string) =>
   profile(id)
     .then((p) => users.updateOne({ _id: id }, { $set: { ...p, syncedAt: new Date() } }))
-    .catch((e) => console.error(`profile ${id}:`, e.message));
+    .catch((e) => logErr(`profile ${id}`, e));
+
+/** Banner and accent colour are the only things a member listing leaves out. */
+const saveBanner = async (id: string) => {
+  const u = await bot.users.fetch(id, { force: true });
+  await users.updateOne({ _id: id }, { $set: { banner: u.bannerURL({ size: 1024 }) ?? null, accentColor: u.hexAccentColor ?? null } });
+};
 
 async function refresh(id: string) {
   const doc = await users.findOne({ _id: id });
@@ -80,15 +111,12 @@ async function refresh(id: string) {
   return true;
 }
 
+/** Re-read every tracked profile, 5 at a time. Runs on a timer and in the background, never while a command waits. */
 async function scan() {
   let n = 0;
-  for (const id of tracked) {
-    try {
-      if (await refresh(id)) n++;
-    } catch (e) {
-      logErr(`profile ${id}`, e);
-    }
-  }
+  await pool([...tracked], 5, async (id) => {
+    if (await refresh(id)) n++;
+  });
   return n;
 }
 
@@ -119,7 +147,6 @@ async function checkMember(id: string, roleIds: string[] | null, isBot = false) 
   }
 }
 
-/** Full pass over the server: make the role-based part of the team match Discord exactly. */
 /**
  * Every member of the server, read over REST 1000 at a time. (Fetching through the gateway is
  * limited to about once per 30s and was failing with "opcode 8 was rate limited".)
@@ -143,24 +170,37 @@ function reconcile() {
   return next;
 }
 
+/**
+ * Full pass over the server: make the role-based part of the team match Discord exactly.
+ * One member listing + one bulk write, so it answers in about a second; banners for
+ * newly added people are fetched afterwards in the background.
+ */
 async function reconcileNow() {
   const g = guild();
   if (!g) return { added: 0, removed: 0 };
   const all = await allMembers(g);
-  const want = new Map([...all].filter(([, m]) => !m.user.bot && m.roles.cache.some((r) => roleMap.has(r.id))));
-  let added = 0;
-  for (const m of want.values()) {
-    if (tracked.has(m.id)) continue;
-    await users.updateOne({ _id: m.id }, { $setOnInsert: { addedAt: new Date(), addedBy: 'role' } }, { upsert: true });
-    tracked.add(m.id);
-    await save(m.id);
-    added++;
-  }
-  const stale = await users.find({ ...roleOnly, _id: { $nin: [...want.keys()] } }, { projection: { _id: 1 } }).toArray();
+  const want = [...all.values()].filter((m) => !m.user.bot && m.roles.cache.some((r) => roleMap.has(r.id)));
+  const fresh = want.filter((m) => !tracked.has(m.id)).map((m) => m.id);
+  const now = new Date();
+  if (want.length)
+    await users.bulkWrite(
+      want.map((m) => ({
+        updateOne: {
+          filter: { _id: m.id },
+          update: { $set: { ...fromMember(m), syncedAt: now }, $setOnInsert: { addedAt: now, addedBy: 'role' } },
+          upsert: true,
+        },
+      })),
+      { ordered: false },
+    );
+  for (const id of fresh) tracked.add(id);
+  void pool(fresh, 5, saveBanner);
+
+  const keep = want.map((m) => m.id);
+  const stale = await users.find({ ...roleOnly, _id: { $nin: keep } }, { projection: { _id: 1 } }).toArray();
   if (stale.length) await users.deleteMany({ _id: { $in: stale.map((u) => u._id) } });
   for (const u of stale) tracked.delete(u._id);
-  await scan();
-  return { added, removed: stale.length };
+  return { added: fresh.length, removed: stale.length };
 }
 
 const vouch = (m: Message) => ({
@@ -361,7 +401,8 @@ const run: Record<string, (m: Message, args: string[]) => Promise<View>> = {
 
   async syncprofile() {
     const { added, removed } = await reconcile();
-    return ok('Profiles synced', `**${plural(tracked.size, 'user')}** checked.`, `**${added}** added  |  **${removed}** removed through roles`);
+    void scan().catch((e) => logErr('scan', e)); // full profile refresh continues in the background
+    return ok('Profiles synced', `**${added}** added  |  **${removed}** removed through roles`, `-# Refreshing ${plural(tracked.size, 'profile')} in the background.`);
   },
 
   async help() {
@@ -388,10 +429,11 @@ bot.on(Events.MessageCreate, async (m) => {
   };
   console.log(`[cmd] ${m.author.tag} (${m.author.id}) ran !${name} in ${m.guild.name}`);
   try {
-    await m.channel.sendTyping().catch(() => {});
+    void m.channel.sendTyping().catch(() => {}); // fire and forget, never wait on it
     // The bot owner is always allowed; everyone else needs Manage Server.
     if (m.author.id !== OWNER_ID) {
-      const member = await m.guild.members.fetch({ user: m.author.id, cache: false });
+      // The message already carries the author's member data; only fetch if it is missing.
+      const member = m.member ?? (await m.guild.members.fetch({ user: m.author.id, cache: false }));
       if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
         return void (await say(fail('No permission', 'You need **Manage Server** or higher to use this bot.')));
       }
@@ -450,7 +492,8 @@ bot.on(Events.Raw, async ({ t, d }: { t: string; d: any }) => {
 bot.once(Events.ClientReady, (c) => {
   console.log(`Ready as ${c.user.tag}`);
   reconcile().catch((e) => logErr("reconcile", e));
-  setInterval(() => reconcile().catch((e) => logErr("reconcile", e)), 30 * 60_000);
+  // Every 30 min: match role members, then refresh avatars/banners for everyone (5 at a time).
+  setInterval(() => reconcile().then(scan).catch((e) => logErr('reconcile', e)), 30 * 60_000);
 });
 
 await bot.login(process.env.DISCORD_TOKEN);
